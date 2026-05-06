@@ -402,6 +402,84 @@ def _apply_relocates(
     return relocated
 
 
+def _apply_relocates_by_readd(
+    master_client: qbittorrentapi.Client,
+    child_client: qbittorrentapi.Client,
+    entries: list[tuple[TorrentEntry, TorrentEntry]],
+    skip_hash_check: bool,
+) -> int:
+    """Delete and re-add torrents to update their save path without moving files.
+
+    Used when the child mounts storage read-only, so setSavePath would return 403.
+    """
+    readded = 0
+    for master_entry, child_entry in entries:
+        h = master_entry.hash
+
+        try:
+            torrent_bytes = master_client.torrents_export(torrent_hash=h)
+        except Exception:
+            log.warning("Failed to export .torrent for %s — skipping", master_entry.name)
+            continue
+
+        if master_entry.file_priorities is None:
+            try:
+                files = master_client.torrents_files(torrent_hash=h)
+                master_entry.file_priorities = [f.priority for f in files]
+            except Exception:
+                log.warning("Failed to fetch file priorities for %s", master_entry.name)
+
+        has_deselected = master_entry.file_priorities and any(
+            p == 0 for p in master_entry.file_priorities
+        )
+
+        try:
+            child_client.torrents_delete(delete_files=False, torrent_hashes=h)
+        except Exception:
+            log.warning("Failed to delete %s before re-add — skipping", master_entry.name, exc_info=True)
+            continue
+
+        add_kwargs: dict = dict(
+            torrent_files=torrent_bytes,
+            save_path=master_entry.save_path,
+            category=master_entry.category,
+            is_skip_checking=skip_hash_check,
+            use_auto_torrent_management=False,
+            is_paused=has_deselected,
+        )
+        if master_entry.download_path:
+            add_kwargs["download_path"] = master_entry.download_path
+
+        try:
+            child_client.torrents_add(**add_kwargs)
+        except Exception:
+            log.warning("Failed to re-add %s — skipping", master_entry.name, exc_info=True)
+            continue
+
+        if has_deselected:
+            deselected_ids = [i for i, p in enumerate(master_entry.file_priorities) if p == 0]
+            time.sleep(1)
+            try:
+                child_client.torrents_file_priority(
+                    torrent_hash=h,
+                    file_ids=deselected_ids,
+                    priority=0,
+                )
+            except Exception:
+                log.warning("Failed to set file priorities for %s", master_entry.name, exc_info=True)
+            child_client.torrents_resume(torrent_hashes=h)
+
+        parts = []
+        if master_entry.save_path != child_entry.save_path:
+            parts.append(f"save_path: {child_entry.save_path} → {master_entry.save_path}")
+        if master_entry.download_path != child_entry.download_path:
+            parts.append(f"temp_path: {child_entry.download_path!r} → {master_entry.download_path!r}")
+        log.info("Re-added torrent (path update): %s (%s)", master_entry.name, "; ".join(parts))
+        readded += 1
+
+    return readded
+
+
 def _filter_needed_file_syncs(
     child_client: qbittorrentapi.Client,
     entries: list[TorrentEntry],
@@ -725,7 +803,10 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         deleted = _apply_deletes(child_client, diff.to_delete)
         added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check)
         recategorized = _apply_recategorize(child_client, diff.to_recategorize)
-        relocated = _apply_relocates(child_client, diff.to_relocate)
+        if child_cfg.readd_on_relocate:
+            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check)
+        else:
+            relocated = _apply_relocates(child_client, diff.to_relocate)
         file_synced = _apply_file_priority_sync(child_client, diff.to_sync_files) if sync_files else 0
 
         console.print(

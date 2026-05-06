@@ -18,6 +18,7 @@ class InstanceConfig:
     password: str
     name: str = ""
     path: str = ""
+    readd_on_relocate: bool = False
     tracker_include: list[re.Pattern[str]] = field(default_factory=list)
     tracker_exclude: list[re.Pattern[str]] = field(default_factory=list)
 
@@ -73,6 +74,7 @@ def _parse_instance(data: dict, default_name: str = "") -> InstanceConfig:
         password=data["password"],
         name=name,
         path=data.get("path", ""),
+        readd_on_relocate=bool(data.get("readd_on_relocate", False)),
         tracker_include=_compile_patterns(data.get("tracker_include"), "tracker_include", name),
         tracker_exclude=_compile_patterns(data.get("tracker_exclude"), "tracker_exclude", name),
     )
