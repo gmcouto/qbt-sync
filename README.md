@@ -1,4 +1,4 @@
-# qbittorrent-sync
+# qbt-sync
 
 Synchronize torrents from a master qBittorrent instance to one or more child instances. Handles adding, deleting, relocating torrents, and syncing file selections.
 
@@ -12,7 +12,7 @@ Create a `config.yaml` (see `config.example.yaml`) and run:
 docker run -d --restart unless-stopped \
   -v ./config.yaml:/app/config.yaml:ro \
   --name qbt-sync \
-  gmcouto/qbt-sync:latest
+  ghcr.io/gmcouto/qbt-sync:latest
 ```
 
 The container runs in daemon mode by default, syncing every N minutes as configured in `daemon_run_interval_minutes`.

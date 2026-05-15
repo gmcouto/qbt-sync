@@ -1,0 +1,63 @@
+name: Build Image
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.head.repo.full_name || github.repository }}-${{ github.event.pull_request.head.ref || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/gmcouto/qbt-sync
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build image
+        run: docker build -t ${{ env.IMAGE }}:${{ github.sha }} .
+
+      - name: Log in to GitHub Container Registry
+        if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+        run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Push sha-tagged image to GHCR
+        if: github.event.pull_request.head.repo.full_name == github.repository || github.event_name != 'pull_request'
+        run: docker push ${{ env.IMAGE }}:${{ github.sha }}
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Log in to GitHub Container Registry
+        run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Pull sha-tagged image and retag as release
+        run: |
+          docker pull ${{ env.IMAGE }}:${{ github.sha }}
+          TAG=${GITHUB_REF#refs/tags/}
+          docker tag ${{ env.IMAGE }}:${{ github.sha }} ${{ env.IMAGE }}:${TAG}
+          docker push ${{ env.IMAGE }}:${TAG}
+          printf "\n## Pushed the following images to GHCR:\n\n" >> $GITHUB_STEP_SUMMARY
+          echo "\`${{ env.IMAGE }}:${TAG}\`" >> $GITHUB_STEP_SUMMARY
+          if [[ "${TAG}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            docker tag ${{ env.IMAGE }}:${{ github.sha }} ${{ env.IMAGE }}:latest
+            docker push ${{ env.IMAGE }}:latest
+            echo "\`${{ env.IMAGE }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          fi
