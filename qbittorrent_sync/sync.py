@@ -6,6 +6,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import requests.exceptions
 
@@ -18,6 +19,38 @@ from qbittorrent_sync.config import AppConfig, InstanceConfig
 log = logging.getLogger("qbt-sync")
 
 _MASTER_TIMEOUT_RECOVERY_SECS = 300
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """Return True if exc or any of its causes is a requests Timeout."""
+    e: BaseException | None = exc
+    while e is not None:
+        if isinstance(e, requests.exceptions.Timeout):
+            return True
+        e = e.__cause__ or e.__context__
+    return False
+
+
+def _read_torrent_from_disk(bt_backup_path: str, torrent_hash: str) -> bytes | None:
+    """Try to read <hash>.torrent directly from the BT_backup directory.
+
+    Returns the raw bytes if found and readable, None otherwise.
+    """
+    if not bt_backup_path:
+        return None
+    torrent_file = Path(bt_backup_path) / f"{torrent_hash}.torrent"
+    try:
+        data = torrent_file.read_bytes()
+        if not data:
+            log.warning("Empty .torrent file on disk: %s", torrent_file)
+            return None
+        log.debug("Read .torrent from disk: %s", torrent_file)
+        return data
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        log.warning("Could not read .torrent from disk (%s): %s", torrent_file, e)
+        return None
 
 
 def _master_timeout_recovery() -> None:
@@ -282,24 +315,27 @@ def _apply_adds(
     entries: list[TorrentEntry],
     skip_hash_check: bool,
     export_timeout: int = 300,
+    bt_backup_path: str = "",
 ) -> int:
     added = 0
     for entry in entries:
-        try:
-            torrent_bytes = master_client.torrents_export(
-                torrent_hash=entry.hash,
-                requests_args={"timeout": export_timeout},
-            )
-        except requests.exceptions.Timeout:
-            log.warning(
-                "Timed out exporting .torrent from master for %s (%s) — skipping",
-                entry.name, entry.hash,
-            )
-            _master_timeout_recovery()
-            continue
-        except Exception:
-            log.warning("Failed to export .torrent for %s — skipping", entry.name)
-            continue
+        torrent_bytes = _read_torrent_from_disk(bt_backup_path, entry.hash)
+        if torrent_bytes is None:
+            try:
+                torrent_bytes = master_client.torrents_export(
+                    torrent_hash=entry.hash,
+                    requests_args={"timeout": export_timeout},
+                )
+            except Exception as e:
+                if _is_timeout(e):
+                    log.warning(
+                        "Timed out exporting .torrent from master for %s (%s) — skipping",
+                        entry.name, entry.hash,
+                    )
+                    _master_timeout_recovery()
+                else:
+                    log.warning("Failed to export .torrent for %s — skipping", entry.name)
+                continue
 
         if entry.file_priorities is None:
             try:
@@ -358,7 +394,10 @@ def _apply_adds(
                 log.warning(
                     "Failed to set file priorities for %s", entry.name, exc_info=True
                 )
-            child_client.torrents_resume(torrent_hashes=entry.hash)
+            try:
+                child_client.torrents_resume(torrent_hashes=entry.hash)
+            except Exception:
+                log.warning("Failed to resume %s after file priority sync", entry.name, exc_info=True)
 
     return added
 
@@ -432,6 +471,7 @@ def _apply_relocates_by_readd(
     entries: list[tuple[TorrentEntry, TorrentEntry]],
     skip_hash_check: bool,
     export_timeout: int = 300,
+    bt_backup_path: str = "",
 ) -> int:
     """Delete and re-add torrents to update their save path without moving files.
 
@@ -441,21 +481,23 @@ def _apply_relocates_by_readd(
     for master_entry, child_entry in entries:
         h = master_entry.hash
 
-        try:
-            torrent_bytes = master_client.torrents_export(
-                torrent_hash=h,
-                requests_args={"timeout": export_timeout},
-            )
-        except requests.exceptions.Timeout:
-            log.warning(
-                "Timed out exporting .torrent from master for %s (%s) — skipping",
-                master_entry.name, h,
-            )
-            _master_timeout_recovery()
-            continue
-        except Exception:
-            log.warning("Failed to export .torrent for %s — skipping", master_entry.name)
-            continue
+        torrent_bytes = _read_torrent_from_disk(bt_backup_path, h)
+        if torrent_bytes is None:
+            try:
+                torrent_bytes = master_client.torrents_export(
+                    torrent_hash=h,
+                    requests_args={"timeout": export_timeout},
+                )
+            except Exception as e:
+                if _is_timeout(e):
+                    log.warning(
+                        "Timed out exporting .torrent from master for %s (%s) — skipping",
+                        master_entry.name, h,
+                    )
+                    _master_timeout_recovery()
+                else:
+                    log.warning("Failed to export .torrent for %s — skipping", master_entry.name)
+                continue
 
         if master_entry.file_priorities is None:
             try:
@@ -502,7 +544,10 @@ def _apply_relocates_by_readd(
                 )
             except Exception:
                 log.warning("Failed to set file priorities for %s", master_entry.name, exc_info=True)
-            child_client.torrents_resume(torrent_hashes=h)
+            try:
+                child_client.torrents_resume(torrent_hashes=h)
+            except Exception:
+                log.warning("Failed to resume %s after file priority sync", master_entry.name, exc_info=True)
 
         parts = []
         if master_entry.save_path != child_entry.save_path:
@@ -756,19 +801,11 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         console.rule(f"[dim]{child_cfg.name}[/] — {child_cfg.host}")
         try:
             child_client = _connect(child_cfg)
-        except requests.exceptions.Timeout:
-            log.error(
-                "Timed out connecting to child %s at %s — skipping cleanup",
-                child_cfg.name,
-                child_cfg.host,
-            )
-            continue
-        except Exception:
-            log.error(
-                "Cannot connect to child %s at %s — skipping cleanup",
-                child_cfg.name,
-                child_cfg.host,
-            )
+        except Exception as e:
+            if _is_timeout(e):
+                log.error("Timed out connecting to child %s at %s — skipping cleanup", child_cfg.name, child_cfg.host)
+            else:
+                log.error("Cannot connect to child %s at %s — skipping cleanup", child_cfg.name, child_cfg.host)
             continue
         _cleanup_stale_torrents(child_client, child_cfg.name, console, dry_run)
 
@@ -776,11 +813,11 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
     console.print(f"\nConnecting to master [bold]{cfg.master.host}[/] …")
     try:
         master_client = _connect(cfg.master)
-    except requests.exceptions.Timeout:
-        log.error("Timed out connecting to master at %s", cfg.master.host)
-        raise
-    except Exception:
-        log.exception("Cannot connect to master at %s", cfg.master.host)
+    except Exception as e:
+        if _is_timeout(e):
+            log.error("Timed out connecting to master at %s", cfg.master.host)
+        else:
+            log.exception("Cannot connect to master at %s", cfg.master.host)
         raise
 
     sync_files = cfg.sync.sync_file_selections
@@ -810,15 +847,11 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         console.rule(f"[bold]{child_cfg.name}[/] — {child_cfg.host}")
         try:
             child_client = _connect(child_cfg)
-        except requests.exceptions.Timeout:
-            log.error(
-                "Timed out connecting to child %s at %s — skipping",
-                child_cfg.name,
-                child_cfg.host,
-            )
-            continue
-        except Exception:
-            log.error("Cannot connect to child %s at %s — skipping", child_cfg.name, child_cfg.host)
+        except Exception as e:
+            if _is_timeout(e):
+                log.error("Timed out connecting to child %s at %s — skipping", child_cfg.name, child_cfg.host)
+            else:
+                log.error("Cannot connect to child %s at %s — skipping", child_cfg.name, child_cfg.host)
             continue
 
         child_torrents = _fetch_child_torrents(child_client)
@@ -853,10 +886,10 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             continue
 
         deleted = _apply_deletes(child_client, diff.to_delete)
-        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5)
+        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path)
         recategorized = _apply_recategorize(child_client, diff.to_recategorize)
         if child_cfg.readd_on_relocate:
-            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5)
+            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path)
         else:
             relocated = _apply_relocates(child_client, diff.to_relocate)
         file_synced = _apply_file_priority_sync(child_client, diff.to_sync_files) if sync_files else 0

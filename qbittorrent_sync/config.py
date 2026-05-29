@@ -44,6 +44,7 @@ class AppConfig:
     master: InstanceConfig
     children: list[InstanceConfig]
     sync: SyncConfig = field(default_factory=SyncConfig)
+    bt_backup_path: str = "/BT_backup"
 
 
 class ConfigError(Exception):
@@ -116,4 +117,9 @@ def load_config(path: str | Path) -> AppConfig:
         daemon_run_interval_minutes=int(sync_raw.get("daemon_run_interval_minutes", 15)),
     )
 
-    return AppConfig(master=master, children=children, sync=sync)
+    return AppConfig(
+        master=master,
+        children=children,
+        sync=sync,
+        bt_backup_path=raw.get("bt_backup_path", "/BT_backup"),
+    )
