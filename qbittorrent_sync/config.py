@@ -22,6 +22,7 @@ class InstanceConfig:
     readd_on_relocate: bool = True
     tracker_include: list[re.Pattern[str]] = field(default_factory=list)
     tracker_exclude: list[re.Pattern[str]] = field(default_factory=list)
+    tracker_preserve: list[re.Pattern[str]] = field(default_factory=list)
 
 
 @dataclass
@@ -80,6 +81,7 @@ def _parse_instance(data: dict, default_name: str = "") -> InstanceConfig:
         readd_on_relocate=bool(data.get("readd_on_relocate", True)),
         tracker_include=_compile_patterns(data.get("tracker_include"), "tracker_include", name),
         tracker_exclude=_compile_patterns(data.get("tracker_exclude"), "tracker_exclude", name),
+        tracker_preserve=_compile_patterns(data.get("tracker_preserve"), "tracker_preserve", name),
     )
 
 

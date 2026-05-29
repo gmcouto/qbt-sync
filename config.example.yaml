@@ -36,7 +36,7 @@ children:
     readd_on_relocate: true  # set to false to use setSavePath instead
 
     # Optional tracker filters (regex, matched against the tracker URL from
-    # the master torrent list). Both are lists of patterns.
+    # the master torrent list). All are lists of patterns.
     #
     # tracker_include: only sync torrents whose tracker matches at least one
     # pattern. If omitted/empty, all trackers are included.
@@ -44,11 +44,18 @@ children:
     # tracker_exclude: skip torrents whose tracker matches any pattern.
     # Applied after include.
     #
+    # tracker_preserve: never delete child-only torrents whose tracker matches
+    # any pattern. Useful when an external tool adds torrents to this child
+    # that master doesn't know about — without this, they would be deleted
+    # on every sync cycle.
+    #
     # Examples:
     # tracker_include:
     #   - "tracker\\.mysite\\.com"
     # tracker_exclude:
     #   - "tracker\\.public\\.example\\.com"
+    # tracker_preserve:
+    #   - "tracker\\.very-important-tracker\\.com"
 
   # Add more children as needed:
   # - name: child2

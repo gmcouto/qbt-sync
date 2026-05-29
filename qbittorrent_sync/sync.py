@@ -359,6 +359,7 @@ def compute_diff(
     master: dict[str, TorrentEntry],
     child: dict[str, TorrentEntry],
     child_name: str,
+    tracker_preserve: list[re.Pattern[str]] | None = None,
 ) -> SyncDiff:
     diff = SyncDiff(child_name=child_name)
 
@@ -366,7 +367,11 @@ def compute_diff(
     child_hashes = set(child)
 
     for h in child_hashes - master_hashes:
-        diff.to_delete.append(child[h])
+        entry = child[h]
+        if tracker_preserve and any(p.search(entry.tracker) for p in tracker_preserve):
+            log.debug("Preserving child-only torrent (tracker_preserve): %s [%s]", entry.name, entry.tracker)
+            continue
+        diff.to_delete.append(entry)
 
     for h in master_hashes - child_hashes:
         diff.to_add.append(master[h])
@@ -902,7 +907,10 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
                 f"  [dim]Tracker filter: {len(translated_master)}/{before} torrent(s) matched[/]"
             )
 
-        diff = compute_diff(translated_master, child_torrents, child_cfg.name)
+        if child_cfg.tracker_preserve:
+            console.print("  [dim]tracker_preserve is active — matching child-only torrents will not be deleted.[/]")
+
+        diff = compute_diff(translated_master, child_torrents, child_cfg.name, tracker_preserve=child_cfg.tracker_preserve or None)
         _print_diff_table(diff, console, dry_run)
 
         if dry_run or diff.is_empty:
