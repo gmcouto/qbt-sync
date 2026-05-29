@@ -88,7 +88,6 @@ class SyncDiff:
     to_add: list[TorrentEntry] = field(default_factory=list)
     to_recategorize: list[tuple[TorrentEntry, TorrentEntry]] = field(default_factory=list)
     to_relocate: list[tuple[TorrentEntry, TorrentEntry]] = field(default_factory=list)
-    to_sync_files: list[TorrentEntry] = field(default_factory=list)
 
     @property
     def is_empty(self) -> bool:
@@ -97,7 +96,6 @@ class SyncDiff:
             and not self.to_add
             and not self.to_recategorize
             and not self.to_relocate
-            and not self.to_sync_files
         )
 
 
@@ -168,7 +166,6 @@ def _fetch_master_torrents(
     client: qbittorrentapi.Client,
     min_seeding_seconds: int,
     *,
-    load_file_priorities: bool = True,
     treat_stopped_as_removed: bool = False,
     private_only: bool = True,
     tracker_include: list[re.Pattern[str]] | None = None,
@@ -234,21 +231,6 @@ def _fetch_master_torrents(
     if private_only and public_count:
         log.info("Excluded %d public torrent(s) from master", public_count)
 
-    if load_file_priorities:
-        for h, entry in result.items():
-            try:
-                files = client.torrents_files(torrent_hash=h)
-                entry.file_priorities = [f.priority for f in files]
-            except Exception:
-                log.warning("Failed to fetch file priorities for %s", entry.name)
-
-        deselected_count = sum(
-            1 for e in result.values()
-            if e.file_priorities and any(p == 0 for p in e.file_priorities)
-        )
-        if deselected_count:
-            log.info("%d torrent(s) have deselected files on master", deselected_count)
-
     return result
 
 
@@ -286,8 +268,6 @@ def compute_diff(
         dl_differs = master[h].download_path != child[h].download_path
         if save_differs or dl_differs:
             diff.to_relocate.append((master[h], child[h]))
-        if master[h].file_priorities and any(p == 0 for p in master[h].file_priorities):
-            diff.to_sync_files.append(master[h])
 
     return diff
 
@@ -303,7 +283,11 @@ def _apply_deletes(
     if not entries:
         return 0
     hashes = [e.hash for e in entries]
-    child_client.torrents_delete(delete_files=False, torrent_hashes=hashes)
+    try:
+        child_client.torrents_delete(delete_files=False, torrent_hashes=hashes)
+    except Exception:
+        log.warning("Failed to delete %d torrent(s) — skipping", len(entries), exc_info=True)
+        return 0
     for e in entries:
         log.info("Deleted torrent: %s", e.name)
     return len(entries)
@@ -316,11 +300,13 @@ def _apply_adds(
     skip_hash_check: bool,
     export_timeout: int = 300,
     bt_backup_path: str = "",
+    skip_file_selection: bool = False,
 ) -> int:
     added = 0
     for entry in entries:
         torrent_bytes = _read_torrent_from_disk(bt_backup_path, entry.hash)
         if torrent_bytes is None:
+            log.debug("Exporting .torrent from master: %s (%s)", entry.name, entry.hash)
             try:
                 torrent_bytes = master_client.torrents_export(
                     torrent_hash=entry.hash,
@@ -334,17 +320,17 @@ def _apply_adds(
                     )
                     _master_timeout_recovery()
                 else:
-                    log.warning("Failed to export .torrent for %s — skipping", entry.name)
+                    log.warning("Failed to export .torrent for %s — skipping", entry.name, exc_info=True)
                 continue
 
-        if entry.file_priorities is None:
+        if not skip_file_selection and entry.file_priorities is None:
             try:
                 files = master_client.torrents_files(torrent_hash=entry.hash)
                 entry.file_priorities = [f.priority for f in files]
             except Exception:
-                log.warning("Failed to fetch file priorities for %s", entry.name)
+                log.warning("Failed to fetch file priorities for %s", entry.name, exc_info=True)
 
-        has_deselected = entry.file_priorities and any(
+        has_deselected = not skip_file_selection and entry.file_priorities and any(
             p == 0 for p in entry.file_priorities
         )
 
@@ -359,6 +345,7 @@ def _apply_adds(
         if entry.download_path:
             add_kwargs["download_path"] = entry.download_path
 
+        log.debug("Adding torrent: %s → %s", entry.name, entry.save_path)
         try:
             child_client.torrents_add(**add_kwargs)
             if entry.download_path:
@@ -483,6 +470,7 @@ def _apply_relocates_by_readd(
 
         torrent_bytes = _read_torrent_from_disk(bt_backup_path, h)
         if torrent_bytes is None:
+            log.debug("Exporting .torrent from master: %s (%s)", master_entry.name, h)
             try:
                 torrent_bytes = master_client.torrents_export(
                     torrent_hash=h,
@@ -496,7 +484,7 @@ def _apply_relocates_by_readd(
                     )
                     _master_timeout_recovery()
                 else:
-                    log.warning("Failed to export .torrent for %s — skipping", master_entry.name)
+                    log.warning("Failed to export .torrent for %s — skipping", master_entry.name, exc_info=True)
                 continue
 
         if master_entry.file_priorities is None:
@@ -504,7 +492,7 @@ def _apply_relocates_by_readd(
                 files = master_client.torrents_files(torrent_hash=h)
                 master_entry.file_priorities = [f.priority for f in files]
             except Exception:
-                log.warning("Failed to fetch file priorities for %s", master_entry.name)
+                log.warning("Failed to fetch file priorities for %s", master_entry.name, exc_info=True)
 
         has_deselected = master_entry.file_priorities and any(
             p == 0 for p in master_entry.file_priorities
@@ -560,76 +548,6 @@ def _apply_relocates_by_readd(
     return readded
 
 
-def _filter_needed_file_syncs(
-    child_client: qbittorrentapi.Client,
-    entries: list[TorrentEntry],
-) -> list[TorrentEntry]:
-    """Keep only entries where the child's file priorities actually differ from master."""
-    needed: list[TorrentEntry] = []
-    for master_entry in entries:
-        if not master_entry.file_priorities:
-            continue
-        try:
-            child_files = child_client.torrents_files(torrent_hash=master_entry.hash)
-        except Exception:
-            needed.append(master_entry)
-            continue
-        has_diff = any(
-            mp == 0 and i < len(child_files) and child_files[i].priority != 0
-            for i, mp in enumerate(master_entry.file_priorities)
-        )
-        if has_diff:
-            needed.append(master_entry)
-    return needed
-
-
-def _apply_file_priority_sync(
-    child_client: qbittorrentapi.Client,
-    entries: list[TorrentEntry],
-) -> int:
-    """Deselect files on child that master has deselected."""
-    synced = 0
-    for master_entry in entries:
-        if not master_entry.file_priorities:
-            continue
-
-        try:
-            child_files = child_client.torrents_files(torrent_hash=master_entry.hash)
-        except Exception:
-            log.warning(
-                "Failed to fetch files for %s on child — skipping", master_entry.name
-            )
-            continue
-
-        ids_to_deselect = [
-            i
-            for i, mp in enumerate(master_entry.file_priorities)
-            if mp == 0 and i < len(child_files) and child_files[i].priority != 0
-        ]
-
-        if not ids_to_deselect:
-            continue
-
-        try:
-            child_client.torrents_file_priority(
-                torrent_hash=master_entry.hash,
-                file_ids=ids_to_deselect,
-                priority=0,
-            )
-            log.info(
-                "Deselected %d file(s) for %s",
-                len(ids_to_deselect),
-                master_entry.name,
-            )
-            synced += 1
-        except Exception:
-            log.warning(
-                "Failed to update file priorities for %s — skipping",
-                master_entry.name,
-                exc_info=True,
-            )
-    return synced
-
 
 # ---------------------------------------------------------------------------
 # Summary output
@@ -676,12 +594,6 @@ def _print_diff_table(diff: SyncDiff, console: Console, dry_run: bool) -> None:
         if len(diff.to_relocate) > 10:
             details.append(f"… and {len(diff.to_relocate) - 10} more")
         table.add_row("[yellow]Relocate[/]", str(len(diff.to_relocate)), "\n".join(details))
-
-    if diff.to_sync_files:
-        names = "\n".join(e.name for e in diff.to_sync_files[:10])
-        if len(diff.to_sync_files) > 10:
-            names += f"\n… and {len(diff.to_sync_files) - 10} more"
-        table.add_row("[magenta]File selection[/]", str(len(diff.to_sync_files)), names)
 
     if diff.is_empty:
         table.add_row("[dim]—[/]", "0", "Already in sync")
@@ -805,9 +717,12 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             if _is_timeout(e):
                 log.error("Timed out connecting to child %s at %s — skipping cleanup", child_cfg.name, child_cfg.host)
             else:
-                log.error("Cannot connect to child %s at %s — skipping cleanup", child_cfg.name, child_cfg.host)
+                log.error("Cannot connect to child %s at %s — skipping cleanup", child_cfg.name, child_cfg.host, exc_info=True)
             continue
-        _cleanup_stale_torrents(child_client, child_cfg.name, console, dry_run)
+        try:
+            _cleanup_stale_torrents(child_client, child_cfg.name, console, dry_run)
+        except Exception:
+            log.error("Cleanup failed for child %s — skipping", child_cfg.name, exc_info=True)
 
     # --- master ---
     console.print(f"\nConnecting to master [bold]{cfg.master.host}[/] …")
@@ -820,12 +735,11 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             log.exception("Cannot connect to master at %s", cfg.master.host)
         raise
 
-    sync_files = cfg.sync.sync_file_selections
+    skip_file_selection = cfg.sync.skip_file_selection
     treat_stopped = cfg.sync.treat_stopped_as_removed
     private_only = cfg.sync.private_only
     master_torrents = _fetch_master_torrents(
         master_client, min_seed_secs,
-        load_file_priorities=sync_files,
         treat_stopped_as_removed=treat_stopped,
         private_only=private_only,
         tracker_include=cfg.master.tracker_include or None,
@@ -838,8 +752,6 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         console.print("  [dim]Only private torrents are being synced (private_only is enabled).[/]")
     if treat_stopped:
         console.print("  [dim]Stopped/paused torrents on master are treated as removed.[/]")
-    if not sync_files:
-        console.print("  [dim]File-selection sync is disabled; skipping bulk file-priority load.[/]")
     console.print()
 
     # --- children ---
@@ -851,10 +763,17 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             if _is_timeout(e):
                 log.error("Timed out connecting to child %s at %s — skipping", child_cfg.name, child_cfg.host)
             else:
-                log.error("Cannot connect to child %s at %s — skipping", child_cfg.name, child_cfg.host)
+                log.error("Cannot connect to child %s at %s — skipping", child_cfg.name, child_cfg.host, exc_info=True)
             continue
 
-        child_torrents = _fetch_child_torrents(child_client)
+        try:
+            child_torrents = _fetch_child_torrents(child_client)
+        except Exception as e:
+            if _is_timeout(e):
+                log.error("Timed out fetching torrent list from child %s — skipping", child_cfg.name)
+            else:
+                log.error("Failed to fetch torrent list from child %s — skipping", child_cfg.name, exc_info=True)
+            continue
         log.debug("Child %s has %d torrent(s)", child_cfg.name, len(child_torrents))
 
         master_path = cfg.master.path
@@ -878,24 +797,20 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             )
 
         diff = compute_diff(translated_master, child_torrents, child_cfg.name)
-        if sync_files:
-            diff.to_sync_files = _filter_needed_file_syncs(child_client, diff.to_sync_files)
         _print_diff_table(diff, console, dry_run)
 
         if dry_run or diff.is_empty:
             continue
 
         deleted = _apply_deletes(child_client, diff.to_delete)
-        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path)
+        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path, skip_file_selection=skip_file_selection)
         recategorized = _apply_recategorize(child_client, diff.to_recategorize)
         if child_cfg.readd_on_relocate:
             relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path)
         else:
             relocated = _apply_relocates(child_client, diff.to_relocate)
-        file_synced = _apply_file_priority_sync(child_client, diff.to_sync_files) if sync_files else 0
 
         console.print(
             f"\n  [bold green]Done:[/] {deleted} deleted, {added} added,"
-            f" {recategorized} recategorized, {relocated} relocated,"
-            f" {file_synced} file-selection synced.\n"
+            f" {recategorized} recategorized, {relocated} relocated.\n"
         )
