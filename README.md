@@ -29,5 +29,5 @@ The container runs in daemon mode by default, syncing every N minutes as configu
    - **Relocate** torrents with mismatched save paths or temp (download) paths
 
 ## qBittorrent UI Hangs
-Some specific `.torrent` files can cause the whole UI to hang if we try to export the `.torrent` file or read the "file selection" data. For these scenarios, please enable the optional mount to `/qbt-data`.
+Some specific `.torrent` files can cause the whole UI and API to hang if we try to export the `.torrent` file or read the "file selection" data. For these scenarios, please enable the optional mount to `/qbt-data`.
 `/qbt-data` mount is completely optional, used to skip `.torrent` export api, that can cause hanging in some specific scenarios (like a whole library of thousands of books in a single `.torrent` file), it will either use your `torrents.db` (SQLite-mode) or `BT_backup` (fastresume-mode) files instead whatever it finds first - for these scenarios you might want to try enabling `skip_file_selection` too.
