@@ -33,7 +33,7 @@ children:
     # of calling setSavePath. Disable only if the child has write access to
     # storage and you want to avoid the torrent being briefly removed during
     # relocation. WARNING: setSavePath will fail silently on read-only mounts.
-    # readd_on_relocate: false  # Defaults to true; set to false to use setSavePath instead
+    readd_on_relocate: true  # set to false to use setSavePath instead
 
     # Optional tracker filters (regex, matched against the tracker URL from
     # the master torrent list). Both are lists of patterns.
@@ -75,7 +75,7 @@ sync:
   # priorities for those via the API can lock up qBittorrent and stall the
   # entire sync cycle. When enabled, torrents are always added unseeded without
   # any file priority adjustments.
-  # skip_file_selection: false
+  skip_file_selection: false
 
   # Treat paused/stopped torrents on master as if they were removed.
   # When enabled, any torrent that is paused or stopped on master will be
