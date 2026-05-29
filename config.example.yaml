@@ -29,11 +29,11 @@ children:
     #   /media/torrent/downloads/movie.mkv → /mnt/data/torrent/downloads/movie.mkv
     # path: "/mnt/data/torrent"
 
-    # When enabled, path changes are applied by deleting and re-adding the
-    # torrent instead of calling setSavePath. Use this when the child mounts
-    # storage read-only: qBittorrent rejects setSavePath on read-only paths,
-    # but torrents_add with skip_hash_check works because no files are moved.
-    # readd_on_relocate: false
+    # Path changes are applied by deleting and re-adding the torrent instead
+    # of calling setSavePath. Disable only if the child has write access to
+    # storage and you want to avoid the torrent being briefly removed during
+    # relocation. WARNING: setSavePath will fail silently on read-only mounts.
+    # readd_on_relocate: false  # Defaults to true; set to false to use setSavePath instead
 
     # Optional tracker filters (regex, matched against the tracker URL from
     # the master torrent list). Both are lists of patterns.

@@ -19,7 +19,7 @@ class InstanceConfig:
     name: str = ""
     path: str = ""
     timeout: int = 60
-    readd_on_relocate: bool = False
+    readd_on_relocate: bool = True
     tracker_include: list[re.Pattern[str]] = field(default_factory=list)
     tracker_exclude: list[re.Pattern[str]] = field(default_factory=list)
 
@@ -76,7 +76,7 @@ def _parse_instance(data: dict, default_name: str = "") -> InstanceConfig:
         name=name,
         path=data.get("path", ""),
         timeout=int(data.get("timeout", 60)),
-        readd_on_relocate=bool(data.get("readd_on_relocate", False)),
+        readd_on_relocate=bool(data.get("readd_on_relocate", True)),
         tracker_include=_compile_patterns(data.get("tracker_include"), "tracker_include", name),
         tracker_exclude=_compile_patterns(data.get("tracker_exclude"), "tracker_exclude", name),
     )
