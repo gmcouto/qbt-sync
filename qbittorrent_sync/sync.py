@@ -293,6 +293,71 @@ def _apply_deletes(
     return len(entries)
 
 
+def _fetch_torrent_bytes(
+    master_client: qbittorrentapi.Client,
+    entry: TorrentEntry,
+    export_timeout: int,
+    bt_backup_path: str,
+) -> bytes | None:
+    """Return raw .torrent bytes from disk cache or master export. Returns None and handles logging/recovery on failure."""
+    data = _read_torrent_from_disk(bt_backup_path, entry.hash)
+    if data is not None:
+        return data
+    log.debug("Exporting .torrent from master: %s (%s)", entry.name, entry.hash)
+    try:
+        return master_client.torrents_export(
+            torrent_hash=entry.hash,
+            requests_args={"timeout": export_timeout},
+        )
+    except Exception as e:
+        if _is_timeout(e):
+            log.warning(
+                "Timed out exporting .torrent from master for %s (%s) — skipping",
+                entry.name, entry.hash,
+            )
+            _master_timeout_recovery()
+        else:
+            log.warning("Failed to export .torrent for %s — skipping", entry.name, exc_info=True)
+        return None
+
+
+def _populate_file_priorities(
+    master_client: qbittorrentapi.Client,
+    entry: TorrentEntry,
+    skip_file_selection: bool,
+) -> None:
+    """Fetch and cache file priorities on *entry* if not already populated."""
+    if skip_file_selection or entry.file_priorities is not None:
+        return
+    try:
+        files = master_client.torrents_files(torrent_hash=entry.hash)
+        entry.file_priorities = [f.priority for f in files]
+    except Exception:
+        log.warning("Failed to fetch file priorities for %s", entry.name, exc_info=True)
+
+
+def _apply_file_deselections(
+    child_client: qbittorrentapi.Client,
+    entry: TorrentEntry,
+) -> None:
+    """Set priority=0 for deselected files then resume the torrent."""
+    deselected_ids = [i for i, p in enumerate(entry.file_priorities) if p == 0]
+    time.sleep(1)
+    try:
+        child_client.torrents_file_priority(
+            torrent_hash=entry.hash,
+            file_ids=deselected_ids,
+            priority=0,
+        )
+        log.debug("Deselected %d file(s) for %s", len(deselected_ids), entry.name)
+    except Exception:
+        log.warning("Failed to set file priorities for %s", entry.name, exc_info=True)
+    try:
+        child_client.torrents_resume(torrent_hashes=entry.hash)
+    except Exception:
+        log.warning("Failed to resume %s after file priority sync", entry.name, exc_info=True)
+
+
 def _apply_adds(
     master_client: qbittorrentapi.Client,
     child_client: qbittorrentapi.Client,
@@ -304,31 +369,11 @@ def _apply_adds(
 ) -> int:
     added = 0
     for entry in entries:
-        torrent_bytes = _read_torrent_from_disk(bt_backup_path, entry.hash)
+        torrent_bytes = _fetch_torrent_bytes(master_client, entry, export_timeout, bt_backup_path)
         if torrent_bytes is None:
-            log.debug("Exporting .torrent from master: %s (%s)", entry.name, entry.hash)
-            try:
-                torrent_bytes = master_client.torrents_export(
-                    torrent_hash=entry.hash,
-                    requests_args={"timeout": export_timeout},
-                )
-            except Exception as e:
-                if _is_timeout(e):
-                    log.warning(
-                        "Timed out exporting .torrent from master for %s (%s) — skipping",
-                        entry.name, entry.hash,
-                    )
-                    _master_timeout_recovery()
-                else:
-                    log.warning("Failed to export .torrent for %s — skipping", entry.name, exc_info=True)
-                continue
+            continue
 
-        if not skip_file_selection and entry.file_priorities is None:
-            try:
-                files = master_client.torrents_files(torrent_hash=entry.hash)
-                entry.file_priorities = [f.priority for f in files]
-            except Exception:
-                log.warning("Failed to fetch file priorities for %s", entry.name, exc_info=True)
+        _populate_file_priorities(master_client, entry, skip_file_selection)
 
         has_deselected = not skip_file_selection and entry.file_priorities and any(
             p == 0 for p in entry.file_priorities
@@ -364,27 +409,7 @@ def _apply_adds(
             continue
 
         if has_deselected:
-            deselected_ids = [
-                i for i, p in enumerate(entry.file_priorities) if p == 0
-            ]
-            time.sleep(1)
-            try:
-                child_client.torrents_file_priority(
-                    torrent_hash=entry.hash,
-                    file_ids=deselected_ids,
-                    priority=0,
-                )
-                log.debug(
-                    "Deselected %d file(s) for %s", len(deselected_ids), entry.name
-                )
-            except Exception:
-                log.warning(
-                    "Failed to set file priorities for %s", entry.name, exc_info=True
-                )
-            try:
-                child_client.torrents_resume(torrent_hashes=entry.hash)
-            except Exception:
-                log.warning("Failed to resume %s after file priority sync", entry.name, exc_info=True)
+            _apply_file_deselections(child_client, entry)
 
     return added
 
@@ -459,6 +484,7 @@ def _apply_relocates_by_readd(
     skip_hash_check: bool,
     export_timeout: int = 300,
     bt_backup_path: str = "",
+    skip_file_selection: bool = False,
 ) -> int:
     """Delete and re-add torrents to update their save path without moving files.
 
@@ -468,33 +494,13 @@ def _apply_relocates_by_readd(
     for master_entry, child_entry in entries:
         h = master_entry.hash
 
-        torrent_bytes = _read_torrent_from_disk(bt_backup_path, h)
+        torrent_bytes = _fetch_torrent_bytes(master_client, master_entry, export_timeout, bt_backup_path)
         if torrent_bytes is None:
-            log.debug("Exporting .torrent from master: %s (%s)", master_entry.name, h)
-            try:
-                torrent_bytes = master_client.torrents_export(
-                    torrent_hash=h,
-                    requests_args={"timeout": export_timeout},
-                )
-            except Exception as e:
-                if _is_timeout(e):
-                    log.warning(
-                        "Timed out exporting .torrent from master for %s (%s) — skipping",
-                        master_entry.name, h,
-                    )
-                    _master_timeout_recovery()
-                else:
-                    log.warning("Failed to export .torrent for %s — skipping", master_entry.name, exc_info=True)
-                continue
+            continue
 
-        if master_entry.file_priorities is None:
-            try:
-                files = master_client.torrents_files(torrent_hash=h)
-                master_entry.file_priorities = [f.priority for f in files]
-            except Exception:
-                log.warning("Failed to fetch file priorities for %s", master_entry.name, exc_info=True)
+        _populate_file_priorities(master_client, master_entry, skip_file_selection)
 
-        has_deselected = master_entry.file_priorities and any(
+        has_deselected = not skip_file_selection and master_entry.file_priorities and any(
             p == 0 for p in master_entry.file_priorities
         )
 
@@ -522,20 +528,7 @@ def _apply_relocates_by_readd(
             continue
 
         if has_deselected:
-            deselected_ids = [i for i, p in enumerate(master_entry.file_priorities) if p == 0]
-            time.sleep(1)
-            try:
-                child_client.torrents_file_priority(
-                    torrent_hash=h,
-                    file_ids=deselected_ids,
-                    priority=0,
-                )
-            except Exception:
-                log.warning("Failed to set file priorities for %s", master_entry.name, exc_info=True)
-            try:
-                child_client.torrents_resume(torrent_hashes=h)
-            except Exception:
-                log.warning("Failed to resume %s after file priority sync", master_entry.name, exc_info=True)
+            _apply_file_deselections(child_client, master_entry)
 
         parts = []
         if master_entry.save_path != child_entry.save_path:
@@ -806,7 +799,7 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path, skip_file_selection=skip_file_selection)
         recategorized = _apply_recategorize(child_client, diff.to_recategorize)
         if child_cfg.readd_on_relocate:
-            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path)
+            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path, skip_file_selection=skip_file_selection)
         else:
             relocated = _apply_relocates(child_client, diff.to_relocate)
 

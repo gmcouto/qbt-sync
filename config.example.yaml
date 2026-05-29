@@ -70,13 +70,12 @@ sync:
   # there is no performance overhead. Requires qBittorrent 5.0+.
   private_only: true
 
-  # Sync deselected files from master to existing child torrents.
-  # When disabled, file selections are still applied to newly added torrents,
-  # but the expensive bulk load of all master file priorities is skipped.
-  # WARNING: Enabling this requires fetching file priorities for every torrent
-  # individually even for calculating small diffs, which can make each sync 
-  # cycle easily take 30 minutes when you have thousands of torrents.
-  sync_file_selections: false
+  # Disable all file-selection syncing (both on add and for existing torrents).
+  # Enable this if you have torrents with thousands of files — fetching file
+  # priorities for those via the API can lock up qBittorrent and stall the
+  # entire sync cycle. When enabled, torrents are always added unseeded without
+  # any file priority adjustments.
+  # skip_file_selection: false
 
   # Treat paused/stopped torrents on master as if they were removed.
   # When enabled, any torrent that is paused or stopped on master will be
