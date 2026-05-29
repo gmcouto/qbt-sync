@@ -65,7 +65,7 @@ def _connect(instance: InstanceConfig) -> qbittorrentapi.Client:
         host=instance.host,
         username=instance.username,
         password=instance.password,
-        REQUESTS_TIMEOUT=instance.timeout,
+        REQUESTS_ARGS={"timeout": instance.timeout},
     )
     client.auth_log_in()
     log.debug("Connected to %s (%s)", instance.name, instance.host)
