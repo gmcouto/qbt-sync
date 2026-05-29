@@ -151,9 +151,21 @@ def _read_torrent_from_sqlite(qbt_data_path: str, torrent_hash: str) -> bytes | 
                     flat = [u for tier in tracker_tiers for u in tier if isinstance(u, bytes)]
                     if flat:
                         torrent[b"announce"] = flat[0]
+                else:
+                    log.warning(
+                        "SQLite resume data for %s has no trackers — skipping SQLite, falling back to next source",
+                        torrent_hash,
+                    )
+                    return None
                 url_list = resume.get(b"url-list")
                 if url_list:  # omit if absent or empty list
                     torrent[b"url-list"] = url_list
+        else:
+            log.warning(
+                "SQLite resume data for %s is empty — skipping SQLite, falling back to next source",
+                torrent_hash,
+            )
+            return None
 
         data = _bencode_encode(torrent)
         log.debug("Reconstructed .torrent from SQLite for %s", torrent_hash)
