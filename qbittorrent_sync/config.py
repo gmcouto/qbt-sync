@@ -44,7 +44,7 @@ class AppConfig:
     master: InstanceConfig
     children: list[InstanceConfig]
     sync: SyncConfig = field(default_factory=SyncConfig)
-    bt_backup_path: str = "/BT_backup"
+    qbt_data_path: str = "/qbt-data"
 
 
 class ConfigError(Exception):
@@ -121,5 +121,5 @@ def load_config(path: str | Path) -> AppConfig:
         master=master,
         children=children,
         sync=sync,
-        bt_backup_path=raw.get("bt_backup_path", "/BT_backup"),
+        qbt_data_path=raw.get("qbt_data_path", "/qbt-data"),
     )

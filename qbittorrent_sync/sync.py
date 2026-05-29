@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -31,14 +32,14 @@ def _is_timeout(exc: BaseException) -> bool:
     return False
 
 
-def _read_torrent_from_disk(bt_backup_path: str, torrent_hash: str) -> bytes | None:
+def _read_torrent_from_disk(qbt_data_path: str, torrent_hash: str) -> bytes | None:
     """Try to read <hash>.torrent directly from the BT_backup directory.
 
     Returns the raw bytes if found and readable, None otherwise.
     """
-    if not bt_backup_path:
+    if not qbt_data_path:
         return None
-    torrent_file = Path(bt_backup_path) / f"{torrent_hash}.torrent"
+    torrent_file = Path(qbt_data_path) / "BT_backup" / f"{torrent_hash}.torrent"
     try:
         data = torrent_file.read_bytes()
         if not data:
@@ -50,6 +51,115 @@ def _read_torrent_from_disk(bt_backup_path: str, torrent_hash: str) -> bytes | N
         return None
     except OSError as e:
         log.warning("Could not read .torrent from disk (%s): %s", torrent_file, e)
+        return None
+
+
+class _RawBytes(bytes):
+    """Already-bencoded bytes — written verbatim by _bencode_encode."""
+
+
+def _bencode_decode(data: bytes, offset: int = 0) -> tuple[object, int]:
+    ch = data[offset:offset + 1]
+    if ch == b'i':
+        end = data.index(b'e', offset + 1)
+        return int(data[offset + 1:end]), end + 1
+    elif ch == b'l':
+        result, offset = [], offset + 1
+        while data[offset:offset + 1] != b'e':
+            val, offset = _bencode_decode(data, offset)
+            result.append(val)
+        return result, offset + 1
+    elif ch == b'd':
+        result, offset = {}, offset + 1
+        while data[offset:offset + 1] != b'e':
+            key, offset = _bencode_decode(data, offset)
+            val_start = offset
+            if key == b'info':
+                _, val_end = _bencode_decode(data, offset)
+                result[key] = _RawBytes(data[val_start:val_end])
+                offset = val_end
+            else:
+                val, offset = _bencode_decode(data, offset)
+                result[key] = val
+        return result, offset + 1
+    elif ch.isdigit():
+        colon = data.index(b':', offset)
+        n = int(data[offset:colon])
+        start = colon + 1
+        return bytes(data[start:start + n]), start + n
+    else:
+        raise ValueError(f"Invalid bencode byte {ch!r} at offset {offset}")
+
+
+def _bencode_encode(value: object) -> bytes:
+    if isinstance(value, _RawBytes):
+        return bytes(value)
+    elif isinstance(value, bytes):
+        return b"%d:" % len(value) + value
+    elif isinstance(value, int):
+        return b"i%de" % value
+    elif isinstance(value, list):
+        return b"l" + b"".join(_bencode_encode(v) for v in value) + b"e"
+    elif isinstance(value, dict):
+        items = sorted(value.items())
+        return b"d" + b"".join(_bencode_encode(k) + _bencode_encode(v) for k, v in items) + b"e"
+    else:
+        raise TypeError(f"Cannot bencode {type(value).__name__}")
+
+
+def _read_torrent_from_sqlite(qbt_data_path: str, torrent_hash: str) -> bytes | None:
+    """Reconstruct a .torrent from qBittorrent's SQLite resume database.
+
+    Returns None if db absent, hash not found, or metadata is NULL (unresolved magnet).
+    """
+    if not qbt_data_path:
+        return None
+    db_path = Path(qbt_data_path) / "torrents.db"
+    if not db_path.exists():
+        return None
+    try:
+        with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as conn:
+            row = conn.execute(
+                "SELECT metadata, libtorrent_resume_data FROM torrents WHERE torrent_id = ?",
+                (torrent_hash,),
+            ).fetchone()
+        if row is None or row[0] is None:
+            return None
+        meta_blob = bytes(row[0])
+        resume_blob = bytes(row[1]) if row[1] else b""
+    except sqlite3.Error as e:
+        log.warning("Could not read SQLite db (%s): %s", db_path, e)
+        return None
+
+    try:
+        meta, _ = _bencode_decode(meta_blob)
+        if not isinstance(meta, dict) or b"info" not in meta:
+            return None
+
+        torrent: dict = {b"info": meta[b"info"]}  # _RawBytes — written verbatim
+
+        for key in (b"creation date", b"created by", b"comment"):
+            if key in meta:
+                torrent[key] = meta[key]
+
+        if resume_blob:
+            resume, _ = _bencode_decode(resume_blob)
+            if isinstance(resume, dict):
+                tracker_tiers = resume.get(b"trackers", [])
+                if tracker_tiers:
+                    torrent[b"announce-list"] = tracker_tiers
+                    flat = [u for tier in tracker_tiers for u in tier if isinstance(u, bytes)]
+                    if flat:
+                        torrent[b"announce"] = flat[0]
+                url_list = resume.get(b"url-list")
+                if url_list:  # omit if absent or empty list
+                    torrent[b"url-list"] = url_list
+
+        data = _bencode_encode(torrent)
+        log.debug("Reconstructed .torrent from SQLite for %s", torrent_hash)
+        return data
+    except Exception as e:
+        log.warning("Failed to reconstruct .torrent from SQLite for %s: %s", torrent_hash, e)
         return None
 
 
@@ -297,10 +407,13 @@ def _fetch_torrent_bytes(
     master_client: qbittorrentapi.Client,
     entry: TorrentEntry,
     export_timeout: int,
-    bt_backup_path: str,
+    qbt_data_path: str,
 ) -> bytes | None:
-    """Return raw .torrent bytes from disk cache or master export. Returns None and handles logging/recovery on failure."""
-    data = _read_torrent_from_disk(bt_backup_path, entry.hash)
+    """Return raw .torrent bytes from disk, SQLite db, or master API export."""
+    data = _read_torrent_from_disk(qbt_data_path, entry.hash)
+    if data is not None:
+        return data
+    data = _read_torrent_from_sqlite(qbt_data_path, entry.hash)
     if data is not None:
         return data
     log.debug("Exporting .torrent from master: %s (%s)", entry.name, entry.hash)
@@ -364,12 +477,12 @@ def _apply_adds(
     entries: list[TorrentEntry],
     skip_hash_check: bool,
     export_timeout: int = 300,
-    bt_backup_path: str = "",
+    qbt_data_path: str = "",
     skip_file_selection: bool = False,
 ) -> int:
     added = 0
     for entry in entries:
-        torrent_bytes = _fetch_torrent_bytes(master_client, entry, export_timeout, bt_backup_path)
+        torrent_bytes = _fetch_torrent_bytes(master_client, entry, export_timeout, qbt_data_path)
         if torrent_bytes is None:
             continue
 
@@ -483,7 +596,7 @@ def _apply_relocates_by_readd(
     entries: list[tuple[TorrentEntry, TorrentEntry]],
     skip_hash_check: bool,
     export_timeout: int = 300,
-    bt_backup_path: str = "",
+    qbt_data_path: str = "",
     skip_file_selection: bool = False,
 ) -> int:
     """Delete and re-add torrents to update their save path without moving files.
@@ -494,7 +607,7 @@ def _apply_relocates_by_readd(
     for master_entry, child_entry in entries:
         h = master_entry.hash
 
-        torrent_bytes = _fetch_torrent_bytes(master_client, master_entry, export_timeout, bt_backup_path)
+        torrent_bytes = _fetch_torrent_bytes(master_client, master_entry, export_timeout, qbt_data_path)
         if torrent_bytes is None:
             continue
 
@@ -796,10 +909,10 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
             continue
 
         deleted = _apply_deletes(child_client, diff.to_delete)
-        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path, skip_file_selection=skip_file_selection)
+        added = _apply_adds(master_client, child_client, diff.to_add, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, qbt_data_path=cfg.qbt_data_path, skip_file_selection=skip_file_selection)
         recategorized = _apply_recategorize(child_client, diff.to_recategorize)
         if child_cfg.readd_on_relocate:
-            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, bt_backup_path=cfg.bt_backup_path, skip_file_selection=skip_file_selection)
+            relocated = _apply_relocates_by_readd(master_client, child_client, diff.to_relocate, cfg.sync.skip_hash_check, export_timeout=cfg.master.timeout * 5, qbt_data_path=cfg.qbt_data_path, skip_file_selection=skip_file_selection)
         else:
             relocated = _apply_relocates(child_client, diff.to_relocate)
 
