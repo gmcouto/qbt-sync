@@ -1,0 +1,33 @@
+# qbt-sync settings for `test/compose.yaml` (qbt-sync container on internal_network).
+#
+# API: master listens on 9080, child on 9081 inside the stack (see QBT_WEBUI_PORT).
+# Data: compose mounts test/qbt-master/qBittorrent/data → /qbt-data (torrents.db / BT_backup).
+#
+# WebUI credentials default to admin / adminadmin on first start. The committed
+# qbt-master / qbt-child profile trees may already use a different password; if
+# login fails, match the password here or reset those profile dirs (see test/README.md).
+
+qbt_data_path: "/qbt-data"
+
+master:
+  name: master
+  host: "http://qbt-master:9080"
+  username: admin
+  password: adminadmin
+  path: "/downloads"
+
+children:
+  - name: child
+    host: "http://qbt-child:9081"
+    username: admin
+    password: adminadmin
+    path: "/downloads"
+
+sync:
+  min_seeding_time_minutes: 0
+  skip_hash_check: true
+  private_only: false
+  skip_file_selection: false
+  treat_stopped_as_removed: false
+  daemon_run_interval_minutes: 1
+  dry_run: false

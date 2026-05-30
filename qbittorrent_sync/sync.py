@@ -32,10 +32,29 @@ def _is_timeout(exc: BaseException) -> bool:
     return False
 
 
+def _metainfo_has_announces(meta: dict) -> bool:
+    """True if metainfo dict has a non-empty announce or a usable announce-list."""
+    ann = meta.get(b"announce")
+    if isinstance(ann, bytes) and len(ann) > 0:
+        return True
+    alist = meta.get(b"announce-list")
+    if not isinstance(alist, list) or not alist:
+        return False
+    for tier in alist:
+        if not isinstance(tier, list):
+            continue
+        for u in tier:
+            if isinstance(u, bytes) and len(u) > 0:
+                return True
+    return False
+
+
 def _read_torrent_from_disk(qbt_data_path: str, torrent_hash: str) -> bytes | None:
     """Try to read <hash>.torrent directly from the BT_backup directory.
 
-    Returns the raw bytes if found and readable, None otherwise.
+    Returns the raw bytes if found and readable. If the file bdecodes to a dict
+    with ``info`` but has no non-empty ``announce`` or ``announce-list`` URLs,
+    returns None so callers can fall back to SQLite or API export.
     """
     if not qbt_data_path:
         return None
@@ -45,6 +64,16 @@ def _read_torrent_from_disk(qbt_data_path: str, torrent_hash: str) -> bytes | No
         if not data:
             log.warning("Empty .torrent file on disk: %s", torrent_file)
             return None
+        try:
+            meta, _ = _bencode_decode(data)
+            if isinstance(meta, dict) and b"info" in meta and not _metainfo_has_announces(meta):
+                log.warning(
+                    "Disk .torrent for %s has no announce/announce-list — skipping disk, trying next source",
+                    torrent_hash,
+                )
+                return None
+        except Exception:
+            pass
         log.debug("Read .torrent from disk: %s", torrent_file)
         return data
     except FileNotFoundError:
@@ -110,7 +139,9 @@ def _bencode_encode(value: object) -> bytes:
 def _read_torrent_from_sqlite(qbt_data_path: str, torrent_hash: str) -> bytes | None:
     """Reconstruct a .torrent from qBittorrent's SQLite resume database.
 
-    Returns None if db absent, hash not found, or metadata is NULL (unresolved magnet).
+    Returns None if db absent, hash not found, metadata is NULL (unresolved magnet),
+    resume data is missing or not a dict, ``trackers`` is empty, or ``trackers`` has
+    no usable byte-string URLs (malformed / empty tiers).
     """
     if not qbt_data_path:
         return None
@@ -144,22 +175,41 @@ def _read_torrent_from_sqlite(qbt_data_path: str, torrent_hash: str) -> bytes | 
 
         if resume_blob:
             resume, _ = _bencode_decode(resume_blob)
-            if isinstance(resume, dict):
-                tracker_tiers = resume.get(b"trackers", [])
-                if tracker_tiers:
-                    torrent[b"announce-list"] = tracker_tiers
-                    flat = [u for tier in tracker_tiers for u in tier if isinstance(u, bytes)]
-                    if flat:
-                        torrent[b"announce"] = flat[0]
-                else:
-                    log.warning(
-                        "SQLite resume data for %s has no trackers — skipping SQLite, falling back to next source",
-                        torrent_hash,
-                    )
-                    return None
-                url_list = resume.get(b"url-list")
-                if url_list:  # omit if absent or empty list
-                    torrent[b"url-list"] = url_list
+            if not isinstance(resume, dict):
+                log.warning(
+                    "SQLite resume data for %s is not a dict after decode — skipping SQLite, falling back to next source",
+                    torrent_hash,
+                )
+                return None
+
+            tracker_tiers = resume.get(b"trackers", [])
+            if not tracker_tiers:
+                log.warning(
+                    "SQLite resume data for %s has no trackers — skipping SQLite, falling back to next source",
+                    torrent_hash,
+                )
+                return None
+
+            flat = [
+                u
+                for tier in tracker_tiers
+                if isinstance(tier, list)
+                for u in tier
+                if isinstance(u, bytes) and len(u) > 0
+            ]
+            if not flat:
+                log.warning(
+                    "SQLite resume data for %s has trackers but no usable announce URLs — skipping SQLite, falling back to next source",
+                    torrent_hash,
+                )
+                return None
+
+            torrent[b"announce-list"] = tracker_tiers
+            torrent[b"announce"] = flat[0]
+
+            url_list = resume.get(b"url-list")
+            if url_list:  # omit if absent or empty list
+                torrent[b"url-list"] = url_list
         else:
             log.warning(
                 "SQLite resume data for %s is empty — skipping SQLite, falling back to next source",
@@ -292,9 +342,17 @@ def _fetch_master_torrents(
     private_only: bool = True,
     tracker_include: list[re.Pattern[str]] | None = None,
     tracker_exclude: list[re.Pattern[str]] | None = None,
+    debug_sync_anything: bool = False,
 ) -> dict[str, TorrentEntry]:
     """Return eligible master torrents keyed by info-hash."""
     torrents = client.torrents_info()
+
+    if debug_sync_anything:
+        log.warning(
+            "Debug sync-anything: using every master torrent (ignoring master tracker filters, "
+            "private_only, completion/progress, min seeding time, and treat_stopped_as_removed)"
+        )
+        return {t["hash"]: _torrent_to_entry(t) for t in torrents}
 
     if tracker_include or tracker_exclude:
         before = len(torrents)
@@ -826,7 +884,13 @@ def _filter_by_tracker(
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
-def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
+def run_sync(
+    cfg: AppConfig,
+    *,
+    dry_run: bool,
+    console: Console,
+    debug_sync_anything: bool = False,
+) -> None:
     """Execute a full sync cycle."""
     min_seed_secs = cfg.sync.min_seeding_time_minutes * 60
 
@@ -867,13 +931,21 @@ def run_sync(cfg: AppConfig, *, dry_run: bool, console: Console) -> None:
         private_only=private_only,
         tracker_include=cfg.master.tracker_include or None,
         tracker_exclude=cfg.master.tracker_exclude or None,
+        debug_sync_anything=debug_sync_anything,
     )
-    console.print(f"  Found [bold]{len(master_torrents)}[/] eligible torrent(s) on master.")
-    if cfg.master.tracker_include or cfg.master.tracker_exclude:
+    if debug_sync_anything:
+        console.print(
+            "  [bold yellow]WARNING:[/] Debug sync-anything mode — master eligibility rules are ignored; "
+            "per-child tracker_include / tracker_exclude still apply."
+        )
+        console.print(f"  Found [bold]{len(master_torrents)}[/] torrent(s) on master (full list).")
+    else:
+        console.print(f"  Found [bold]{len(master_torrents)}[/] eligible torrent(s) on master.")
+    if not debug_sync_anything and (cfg.master.tracker_include or cfg.master.tracker_exclude):
         console.print("  [dim]Master tracker filter is active.[/]")
-    if private_only:
+    if not debug_sync_anything and private_only:
         console.print("  [dim]Only private torrents are being synced (private_only is enabled).[/]")
-    if treat_stopped:
+    if not debug_sync_anything and treat_stopped:
         console.print("  [dim]Stopped/paused torrents on master are treated as removed.[/]")
     console.print()
 

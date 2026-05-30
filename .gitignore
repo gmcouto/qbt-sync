@@ -19,9 +19,24 @@ env/
 *.swp
 *.swo
 
-# Config (contains credentials)
+# Config (contains credentials); allow checked-in test stack fixture
 config.yaml
+!test/qbt-sync/config.yaml
 
 # OS
 .DS_Store
 Thumbs.db
+
+# Test qBittorrent profile dirs — only version qBittorrent.conf
+test/qbt-master/**
+!test/qbt-master/qBittorrent/
+test/qbt-master/qBittorrent/**
+!test/qbt-master/qBittorrent/config/
+test/qbt-master/qBittorrent/config/**
+!test/qbt-master/qBittorrent/config/qBittorrent.conf
+test/qbt-child/**
+!test/qbt-child/qBittorrent/
+test/qbt-child/qBittorrent/**
+!test/qbt-child/qBittorrent/config/
+test/qbt-child/qBittorrent/config/**
+!test/qbt-child/qBittorrent/config/qBittorrent.conf

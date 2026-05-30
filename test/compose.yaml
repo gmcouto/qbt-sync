@@ -1,0 +1,97 @@
+# Local integration stack for qbt-sync (API + SQLite / BT_backup paths).
+#
+# qBittorrent + qbt-sync use internal_network (internal: true) — no outbound internet.
+# Docker often does not publish ports for containers on internal-only networks, so the
+# Web UI is reached via webui-proxy: nginx on internal_network + edge; only the proxy
+# has published ports (127.0.0.1:9080 / :9081).
+#
+# From the repository root:
+#   docker compose -f test/compose.yaml build qbt-sync
+#   docker compose -f test/compose.yaml up -d qbt-master qbt-child webui-proxy qbt-sync
+#   (qbt-sync uses --daemon --verbose --debug-sync-anything for the lab sync set.)
+# After Web UIs respond on localhost:9080 / :9081, one-shot sync instead:
+#   docker compose -f test/compose.yaml run --rm qbt-sync
+#
+# Paths in this file are relative to this compose file (the test/ directory).
+
+services:
+  qbt-master:
+    image: qbittorrentofficial/qbittorrent-nox:5.1.4-2
+    container_name: qbt-master
+    hostname: qbt-master
+    environment:
+      TZ: UTC
+      PUID: "1000"
+      PGID: "1000"
+      QBT_LEGAL_NOTICE: confirm
+      # WebUI listens on 9080 inside the container; the host reaches it via webui-proxy on 127.0.0.1:9080.
+      QBT_WEBUI_PORT: "9080"
+      QBT_TORRENTING_PORT: "6881"
+    volumes:
+      - ./qbt-master:/config
+      - ./downloads:/downloads:ro
+    networks:
+      - internal_network
+
+  qbt-child:
+    image: qbittorrentofficial/qbittorrent-nox:5.1.4-2
+    container_name: qbt-child
+    hostname: qbt-child
+    environment:
+      TZ: UTC
+      PUID: "1000"
+      PGID: "1000"
+      QBT_LEGAL_NOTICE: confirm
+      QBT_WEBUI_PORT: "9081"
+      QBT_TORRENTING_PORT: "6882"
+    volumes:
+      - ./qbt-child:/config
+      - ./downloads:/downloads:ro
+    networks:
+      - internal_network
+
+  # Publishes Web UI to the host; qBittorrent stays internal-only (see header comment).
+  webui-proxy:
+    image: nginx:1.27-alpine
+    container_name: webui-proxy
+    restart: unless-stopped
+    depends_on:
+      - qbt-master
+      - qbt-child
+    networks:
+      internal_network: {}
+      edge: {}
+    ports:
+      - "127.0.0.1:9080:80"
+      - "127.0.0.1:9081:81"
+    volumes:
+      - ./webui-proxy/nginx.conf:/etc/nginx/nginx.conf:ro
+
+  qbt-sync:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: qbt-sync:test
+    container_name: qbt-sync
+    depends_on:
+      - qbt-master
+      - qbt-child
+    volumes:
+      - ./qbt-sync/config.yaml:/app/config.yaml:ro
+      # Same host tree as qbt-master:/config — read-only for SQLite / BT_backup reads
+      - ./qbt-master/qBittorrent/data:/qbt-data:ro
+    networks:
+      - internal_network
+    # Daemon + verbose + debug sync set (rebuild image after code changes).
+    command:
+      [
+        "sh",
+        "-c",
+        "sleep 10 && exec qbt-sync --daemon --verbose --debug-sync-anything -c /app/config.yaml",
+      ]
+
+networks:
+  internal_network:
+    internal: true
+  edge:
+    driver: bridge

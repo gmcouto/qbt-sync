@@ -56,7 +56,21 @@ def _setup_logging(verbose: bool) -> None:
     default=False,
     help="Keep running, repeating the sync every N minutes (see daemon_run_interval_minutes).",
 )
-def main(config_path: str, dry_run: bool, verbose: bool, daemon: bool) -> None:
+@click.option(
+    "--debug-sync-anything",
+    is_flag=True,
+    default=False,
+    help="Debug: put every master torrent in the sync set (ignore master eligibility: "
+    "tracker filters, private_only, completion, min seeding time, treat_stopped_as_removed). "
+    "Per-child tracker filters still apply.",
+)
+def main(
+    config_path: str,
+    dry_run: bool,
+    verbose: bool,
+    daemon: bool,
+    debug_sync_anything: bool,
+) -> None:
     """Synchronize torrents from a master qBittorrent instance to children."""
     _setup_logging(verbose)
     log = logging.getLogger("qbt-sync")
@@ -68,13 +82,29 @@ def main(config_path: str, dry_run: bool, verbose: bool, daemon: bool) -> None:
         sys.exit(1)
 
     effective_dry_run = cfg.sync.dry_run if dry_run is None else dry_run
-    log.debug("Loaded config: master=%s, children=%d, dry_run=%s", cfg.master.host, len(cfg.children), effective_dry_run)
+    log.debug(
+        "Loaded config: master=%s, children=%d, dry_run=%s, debug_sync_anything=%s",
+        cfg.master.host,
+        len(cfg.children),
+        effective_dry_run,
+        debug_sync_anything,
+    )
 
     try:
         if daemon:
-            _run_daemon(config_path, dry_run_override=dry_run, log=log)
+            _run_daemon(
+                config_path,
+                dry_run_override=dry_run,
+                log=log,
+                debug_sync_anything=debug_sync_anything,
+            )
         else:
-            run_sync(cfg, dry_run=effective_dry_run, console=console)
+            run_sync(
+                cfg,
+                dry_run=effective_dry_run,
+                console=console,
+                debug_sync_anything=debug_sync_anything,
+            )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted.[/]")
         sys.exit(130)
@@ -83,7 +113,13 @@ def main(config_path: str, dry_run: bool, verbose: bool, daemon: bool) -> None:
         sys.exit(1)
 
 
-def _run_daemon(config_path: str, *, dry_run_override: bool | None, log: logging.Logger) -> None:
+def _run_daemon(
+    config_path: str,
+    *,
+    dry_run_override: bool | None,
+    log: logging.Logger,
+    debug_sync_anything: bool = False,
+) -> None:
     console.print("\n[bold]Daemon mode:[/] Press Ctrl+C to stop.\n")
     prev_sync: SyncConfig | None = None
 
@@ -106,7 +142,12 @@ def _run_daemon(config_path: str, *, dry_run_override: bool | None, log: logging
         console.rule(f"[bold]Sync started at {datetime.now():%Y-%m-%d %H:%M:%S}[/]")
 
         try:
-            run_sync(cfg, dry_run=dry_run, console=console)
+            run_sync(
+                cfg,
+                dry_run=dry_run,
+                console=console,
+                debug_sync_anything=debug_sync_anything,
+            )
         except KeyboardInterrupt:
             raise
         except Exception:
